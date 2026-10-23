@@ -24,8 +24,9 @@ aggregated API. It speaks MCP Streamable HTTP (protocol 2026-07-28, plus the ear
 plain JSON responses and no sessions. kube-apiserver authenticates
 the caller, checks RBAC for `create` on `mcpservers/mcp`, applies priority-and-fairness and its 60s request timeout, and
 proxies the call. Storage accepts only calls that carry kube-apiserver's front-proxy client certificate, checks each
-tool's read against the caller's RBAC (SubjectAccessReview with a short cache), runs the call in its own queue with a
-deadline and a size cap, and reads data through the same in-process storage objects the REST API uses. The first
+tool's read against the caller's RBAC (SubjectAccessReview with a short cache), admits the call through its own limit
+(outside storage's global limiter, so MCP never takes write capacity) with a deadline and a size cap, and reads data
+through the same in-process storage objects the REST API uses. The first
 version exposes the 9 read-only data tools that `kubescape mcpserver` already has (6.5; `list_sboms` and
 `list_sbom_packages` came with [#4229](https://github.com/kubescape/kubescape/pull/4229)). `get_configuration_drift` is
 left out: it also reads the workload itself from the Kubernetes API, which is not storage data.
@@ -133,7 +134,7 @@ flowchart LR
   A["kube-apiserver<br/>2. who is calling?<br/>3. RBAC: create mcpservers/mcp<br/>4. APF + 60s timeout"] -->|"5. forwards with front-proxy cert<br/>+ caller identity"| H
   A -.->|"writes, unchanged"| WR
   subgraph ST["storage, in the Kubescape namespace"]
-    H["MCP handler<br/>6. came via kube-apiserver?<br/>7. may this caller read this data?<br/>8. own queue, deadline, size cap"] --> R["REST storage objects<br/>same code as kubectl get"]
+    H["MCP handler<br/>6. came via kube-apiserver?<br/>7. may this caller read this data?<br/>8. own admission limit, deadline, size cap"] --> R["REST storage objects<br/>same code as kubectl get"]
     WR["write path<br/>queue manager"] --> DB
     R --> DB[("SQLite + files")]
   end
@@ -262,8 +263,8 @@ object include its name, so roles restricted with `resourceNames` work as they d
 
 | Limit | Default | Why |
 |---|---|---|
-| Own queue (`kindQueues.mcpservers`) | length 10, 1 worker | MCP calls wait in their own line and never take a worker from profile or SBOM writes. A full queue answers 429. |
-| Concurrency cap in the MCP handler | 1 call at a time, 10 waiting | The same limit enforced inside the handler, so it holds even when the queue manager is off (see below). |
+| MCP admission, in front of storage's global limiter | 1 call running, 10 waiting, at most 30s of waiting | The outermost handler in storage. A call with no free slot gets 429 with `Retry-After` at once, and so does a call that has waited 30s, so it is answered before kube-apiserver's 60s cut. Running and waiting MCP calls hold only these slots, never a slot of the global limiter, so they cannot use up write capacity (see below). Requests without a client certificate are refused before they take a slot. |
+| Own kind queue (`kindQueues.mcpservers`) | length 10, 1 worker | With the queue manager on, MCP calls also never take a worker from profile or SBOM writes. Sized like the admission limit, so it adds no second limit. |
 | Request body size (`kindQueues.mcpservers.maxObjectSize`, and `http.MaxBytesReader` in the handler) | 64 KB | An MCP request is a few hundred bytes; anything larger is refused with 413 before it is read. |
 | Deadline per call | 20s | Well under kube-apiserver's 60s and Kagent's default 30s tool timeout. Applied to the tool's work (mcp-go tool middleware), not to the HTTP request, so the agent always gets an answer: what the tool has with `truncated: true`, or a `TIMEOUT` tool error. |
 | Response size cap | 256 KB | Keeps answers inside an agent's context. Lists page with `limit`/`offset` or `continue`. |
@@ -275,13 +276,23 @@ the work stops (tested, section 7). All values are configurable.
 
 **Queue manager:** storage's own default is `queueManagerEnabled: false` (`pkg/config/config.go`), and `start.go` attaches
 the queue handler only when it is true. The operator chart turns it on (`storage.queueManagerEnabled: true` in
-`values.yaml`), which is how the prototype ran. Because the handler enforces its own concurrency cap and body limit, the
-MCP limits do not depend on it: with the queue manager on, `mcpservers` also gets its own queue; with it off, the
-handler's limits still apply.
+`values.yaml`), which is how the prototype ran. The admission limit and the body limit are in storage's own handlers,
+so the MCP limits do not depend on it: with the queue manager on, `mcpservers` also gets its own queue; with it off, the
+admission limit still applies.
 
-**Per-client rate limiting:** when `rateLimitPerClient` is above 0 (off by default), `rateLimitTotal` (default 10) is a
-concurrency limit shared by every request, so MCP calls would hold slots that node-agent and kubevuln writes also use.
-The handler's cap keeps MCP to at most 1 of those slots; the Phase 2 load test runs once with rate limiting on to check.
+**Per-client rate limiting:** when `rateLimitPerClient` is above 0 (off by default), `start.go` wraps storage's whole
+handler chain in a concurrency limiter shared by every request (`rateLimitTotal`, default 10). It takes a slot before
+the kind queue and gives it back when the response is done, so a request waiting in a queue holds a slot too. If MCP
+calls went through it, one running call and nine waiting ones would hold all ten and writes would get 429. So MCP
+calls do not go through it: the MCP admission sits in front of the limiter, keeps MCP calls to its own slots and passes
+every other request on to the limiter unchanged. Writes keep all of `rateLimitTotal`. Tested on the prototype (section
+7, tests 19 and 20): with the limiter on and 11 slow MCP calls in flight, writes went from 30 of 30 rejected with 429
+to 0 of 30.
+
+While testing this, the limiter also turned out to count long-running WATCH requests: on kind, kube-controller-manager
+holds 13 cluster-wide watches on storage's resources, so with the default `rateLimitTotal` of 10 storage answers every
+request with 429, its own health probes included. That is a storage issue of its own, separate from this proposal
+([storage#449](https://github.com/kubescape/storage/issues/449)).
 
 ### 6.7 What an agent sees
 
@@ -339,6 +350,9 @@ flowchart TB
 storage:
   mcp:
     enabled: false          # off by default
+    maxRunning: 1           # MCP admission, outside the global limiter (6.6)
+    maxWaiting: 10
+    maxWait: 30s
     callTimeout: 20s
     maxResponseBytes: 262144
     readerClusterRoles: true # create the two ClusterRoles below
@@ -424,7 +438,8 @@ ServiceAccount's `ca.crt`).
 
 To check that the design works in storage itself and not only on paper, I built a prototype on storage `main`
 (18c0968a): the `mcpservers` resource and `mcp` connect subresource, the front-proxy check, the per-tool authorizer, the
-deadline, and three tools (`whoami`, `list_vulnerability_manifests` reading through the in-process REST object, and
+deadline, the MCP admission in front of storage's global limiter (6.6; added for tests 19 and 20), and three tools
+(`whoami`, `list_vulnerability_manifests` reading through the in-process REST object, and
 `slow` for timing tests). It was deployed on kind v1.33.1 from the operator chart's storage templates (v0.0.345 base
 image), with `kindQueues.mcpservers` set to length 1 and 1 worker to make the queue easy to fill. Calls used a
 ServiceAccount token (`system:serviceaccount:mcp-test:agent`) through kube-apiserver unless noted.
@@ -449,6 +464,8 @@ ServiceAccount token (`system:serviceaccount:mcp-test:agent`) through kube-apise
 | 16 | mcp-go client pinned to 2025-11-25, 2025-06-18 and 2025-03-26 | `initialize` → that version, `notifications/initialized` → 202, `tools/list` and `tools/call` work for all three |
 | 17 | The MCP Python SDK version Kagent's agent runtime pins (`mcp` 2.3.0, from Kagent's `uv.lock`) | `initialize()` → 2025-11-25 and `discover()` → 2026-07-28; `tools/list` and `tools/call` work with both |
 | 18 | The Go SDK Kagent's controller uses for `RemoteMCPServer` tool discovery (`modelcontextprotocol/go-sdk` v1.8.0, `StreamableClientTransport`, headers set by an `http.Client` as in Kagent) | 2026-07-28; `tools/list` and `tools/call` work |
+| 19 | Rate limiting on (`rateLimitPerClient: 1000`, `rateLimitTotal: 23`, so 10 slots stay free next to the 13 watches from 6.6), `kindQueues.mcpservers` length 10; 11 MCP calls of 15s at once, then 30 KnownServer creates, 3 at a time; MCP admission switched off | Writes: **30 × 429**. MCP: 3 × 200, 7 × **504** after 60s in the queue, 1 × 429. Writes alone: 30 × 201 |
+| 20 | Same build and load, MCP admission on (1 running, 10 waiting, 30s) | Writes: **30 × 201**, median 0.04s (0.04s with no MCP load). MCP: 2 × 200, 9 × **429** after 30s of waiting, no 504 |
 
 Two kube-apiserver behaviours were checked with a throwaway aggregated server using the same path shape: a 70s call
 is cut with **504** after **60.0s** and the server's request context is cancelled at the same moment, and
@@ -474,7 +491,7 @@ applies). An earlier run with a `proxy` subresource held a stream for 80s+, conf
 | **Audit** | One structured log line per tool call: user, groups, tool, path namespace, target namespace and name, allowed or denied (with the SAR reason), duration, response bytes, error code. kube-apiserver's audit log already records the `create mcpservers/mcp` request itself; this line adds which data the call read. |
 | **Metrics** | Calls by tool and outcome (ok, `RBAC_DENIED`, `TIMEOUT`, error), call latency, response size, queue rejections (429), SAR cache hits and misses. |
 | **Untrusted text reaching an LLM** | Object names, labels, annotations, package names and CVE descriptions are written by workload owners or upstream feeds, and the agent's model reads them. Tools return them only as JSON field values, never as free text mixed with tool instructions; tool descriptions say the fields are data; long strings are cut and the response is capped (256 KB). All tools are read-only, so a prompt injection in the data cannot make the endpoint change anything. Agents must still treat tool output as untrusted input. |
-| **Denial of service by allowed callers** | A caller with the right RBAC can still send many calls. Limits: APF per user in kube-apiserver, the MCP queue and concurrency cap in storage (calls beyond it get 429, writes keep their own queues), the 20s deadline, metadata-only LISTs, the response cap, and the SAR cache that bounds SubjectAccessReview load. |
+| **Denial of service by allowed callers** | A caller with the right RBAC can still send many calls. Limits: APF per user in kube-apiserver, the MCP admission limit in storage (calls beyond it get 429; MCP calls never hold a slot of storage's global limiter, and writes keep their own queues), the 20s deadline, metadata-only LISTs, the response cap, and the SAR cache that bounds SubjectAccessReview load. |
 | **Calls that skip kube-apiserver** | Refused with 401 (front-proxy certificate check, 6.5), so the endpoint does not depend on network policy. |
 
 ## 9. Errors and what the agent gets back
@@ -484,7 +501,7 @@ applies). An earlier run with a `proxy` subresource held a stream for 80s+, conf
 | No permission to use the endpoint in that namespace | HTTP 403 from kube-apiserver |
 | Call did not come through kube-apiserver, or anonymous | HTTP 401 from storage |
 | MCP turned off in the chart | HTTP 404 (the resource is not registered) |
-| Queue full | HTTP 429 |
+| MCP admission or kind queue full | HTTP 429 with `Retry-After` |
 | Request body too large | HTTP 413 |
 | `GET` or any method other than `POST` | HTTP 405 |
 | No permission to read the data a tool needs | Tool error `RBAC_DENIED` |
@@ -499,7 +516,7 @@ applies). An earlier run with a `proxy` subresource held a stream for 80s+, conf
 |---|---|---|---|
 | 1a | storage | `MCPServer` API type with its generated code (deepcopy, clientset, listers, informers, OpenAPI, protobuf, as in [storage#351](https://github.com/kubescape/storage/pull/351)); nothing served yet | Codegen check passes; no behaviour change |
 | 1b | storage | `mcpservers` resource and `mcp` connect subresource behind a config flag (off), front-proxy check, per-tool authorizer, audit line, one tool (`list_vulnerability_manifests`) | The tests in section 7 as unit and kind tests, including Kagent's two MCP clients (tests 17 and 18) |
-| 2 | storage | Queue, concurrency cap, deadline, size cap, metrics; `pkg/mcp/tools` with the other 8 tools and the golden tests (6.8) | Load test: MCP calls next to node-agent writes, write latency unchanged, once with `rateLimitPerClient` on |
+| 2 | storage | MCP admission in front of the global limiter, kind queue, deadline, size cap, metrics; `pkg/mcp/tools` with the other 8 tools and the golden tests (6.8) | Load test: MCP calls next to node-agent writes, write latency unchanged; once with `rateLimitPerClient` on, where MCP adds no write 429s |
 | 3 | helm-charts | `storage.mcp.*` values, the two reader ClusterRoles, docs | `helm template` with MCP on and off |
 | 4 | docs, kagent | Kagent example (RemoteMCPServer + Agent, token setup), CA option followed upstream | A Kagent agent answers "which critical CVEs are in namespace X" on kind |
 | 5 | kubescape | Optional: `kubescape mcpserver` uses `pkg/mcp/tools` | One copy of the read tools |
@@ -514,7 +531,9 @@ Phase 1a is mostly generated code; the other phases are one or two small PRs eac
 - **Integration (kind):** the tests in section 7 against the real change; a Role scoped to one namespace sees only that
   namespace's data.
 - **Load:** MCP calls in a loop while node-agent writes ContainerProfiles; compare write latency and `database is locked`
-  errors with MCP off and on.
+  errors with MCP off and on. Run it again with `rateLimitPerClient` on, with MCP calls filling the admission limit
+  (running and waiting), and compare write 429 counts as well as latency: MCP must add no write rejections (tests 19
+  and 20 as an automated test).
 - **Protocol versions:** one client on 2026-07-28 (`server/discover`) and one on an `initialize`-based version, in CI.
 - **Kagent clients (before Phase 1b merges):** Kagent's Python runtime client and its Go discovery client against the
   real change on kind (tests 17 and 18).
@@ -534,7 +553,8 @@ Phase 1a is mostly generated code; the other phases are one or two small PRs eac
 
 1. **Cache duration** for the per-tool authorizer: shorter means RBAC changes apply sooner, longer means fewer
    SubjectAccessReviews. `storage-grpc-fastpath-auth.md` leaves the same question open; one answer for both would be good.
-2. **Default limits** (queue 10/1, 20s, 256 KB) are a starting point; the load test in phase 2 should set them.
+2. **Default limits** (1 running, 10 waiting for at most 30s, 20s, 256 KB) are a starting point; the load test in phase 2
+   should set them.
 3. **Kagent CA:** wait for Kagent to enable `caCertSecretRef`, or offer to help land it upstream.
 4. **Resource name:** `mcpservers/mcp` reads clearly, but another name may fit the API group better.
 
