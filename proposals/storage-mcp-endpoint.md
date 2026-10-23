@@ -263,7 +263,7 @@ object include its name, so roles restricted with `resourceNames` work as they d
 
 | Limit | Default | Why |
 |---|---|---|
-| MCP admission, in front of storage's global limiter | 1 call running, 10 waiting, at most 30s of waiting | The outermost handler in storage. A call with no free slot gets 429 with `Retry-After` at once, and so does a call that has waited 30s, so it is answered before kube-apiserver's 60s cut. Running and waiting MCP calls hold only these slots, never a slot of the global limiter, so they cannot use up write capacity (see below). Requests without a client certificate are refused before they take a slot. |
+| MCP admission, in front of storage's global limiter | 1 call running, 10 waiting, at most 30s of waiting | The outermost handler in storage. A call with no free slot gets 429 with `Retry-After` at once, and so does a call that has waited 30s, so it is answered before kube-apiserver's 60s cut. Running and waiting MCP calls hold only these slots, never a slot of the global limiter, so they cannot use up write capacity (see below). It runs the front-proxy certificate check from 6.5 (request-header CA and allowed names) first, so a direct caller gets 401 before it takes a slot, even with a certificate signed by the cluster's client CA. The user check of 6.5 still runs in the handler. |
 | Own kind queue (`kindQueues.mcpservers`) | length 10, 1 worker | With the queue manager on, MCP calls also never take a worker from profile or SBOM writes. Sized like the admission limit, so it adds no second limit. |
 | Request body size (`kindQueues.mcpservers.maxObjectSize`, and `http.MaxBytesReader` in the handler) | 64 KB | An MCP request is a few hundred bytes; anything larger is refused with 413 before it is read. |
 | Deadline per call | 20s | Well under kube-apiserver's 60s and Kagent's default 30s tool timeout. Applied to the tool's work (mcp-go tool middleware), not to the HTTP request, so the agent always gets an answer: what the tool has with `truncated: true`, or a `TIMEOUT` tool error. |
@@ -438,7 +438,8 @@ ServiceAccount's `ca.crt`).
 
 To check that the design works in storage itself and not only on paper, I built a prototype on storage `main`
 (18c0968a): the `mcpservers` resource and `mcp` connect subresource, the front-proxy check, the per-tool authorizer, the
-deadline, the MCP admission in front of storage's global limiter (6.6; added for tests 19 and 20), and three tools
+deadline, the MCP admission in front of storage's global limiter (6.6; added for tests 19 and 20; it only checked that
+a client certificate was present), and three tools
 (`whoami`, `list_vulnerability_manifests` reading through the in-process REST object, and
 `slow` for timing tests). It was deployed on kind v1.33.1 from the operator chart's storage templates (v0.0.345 base
 image), with `kindQueues.mcpservers` set to length 1 and 1 worker to make the queue easy to fill. Calls used a
